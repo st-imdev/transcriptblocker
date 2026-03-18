@@ -1,0 +1,23 @@
+[project]
+name = "transcriptblocker"
+version = "0.1.0"
+description = "Adversarial audio perturbation tool to defeat ASR transcription"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchaudio>=2.0",
+    "openai-whisper>=20231117",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "click>=8.0",
+    "rumps>=0.4.0",
+]
+
+[project.scripts]
+transcriptblocker = "transcriptblocker.cli:main"
+transcriptblocker-gui = "transcriptblocker.menubar:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
