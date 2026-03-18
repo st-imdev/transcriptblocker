@@ -25,7 +25,7 @@ Real Mic ──▶ TranscriptBlocker ──▶ BlackHole 2ch ──▶ Zoom / Te
 brew install blackhole-2ch
 
 # 2. Clone and install
-git clone https://github.com/yourusername/transcriptblocker.git
+git clone https://github.com/st-imdev/transcriptblocker.git
 cd transcriptblocker
 uv venv && uv pip install -e .
 
