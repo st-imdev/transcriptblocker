@@ -3,9 +3,13 @@
 import signal
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import click
+
+# Suppress Whisper's FP16/CPU warning — we know we're on CPU
+warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
 
 from . import config
 

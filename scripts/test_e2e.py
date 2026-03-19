@@ -11,7 +11,10 @@ Usage:
 import argparse
 import sys
 import os
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -24,19 +27,38 @@ import scipy.io.wavfile as wavfile
 from transcriptblocker import config
 
 
-def record_audio(duration: float, sample_rate: int = config.SAMPLE_RATE) -> np.ndarray:
-    """Record audio from the default microphone."""
-    print(f"Recording {duration}s of audio from microphone...")
+def record_audio(duration: float, sample_rate: int = config.SAMPLE_RATE, device: int | None = None) -> np.ndarray:
+    """Record audio from the specified (or default) microphone."""
+    # Use the device's native sample rate if it differs, then resample
+    if device is not None:
+        dev_info = sd.query_devices(device)
+        native_sr = int(dev_info["default_samplerate"])
+    else:
+        dev_info = sd.query_devices(kind="input")
+        native_sr = int(dev_info["default_samplerate"])
+
+    print(f"Recording {duration}s from '{dev_info['name']}' at {native_sr} Hz...")
     print("  Speak now!")
     audio = sd.rec(
-        int(duration * sample_rate),
-        samplerate=sample_rate,
+        int(duration * native_sr),
+        samplerate=native_sr,
         channels=1,
         dtype="float32",
+        device=device,
     )
     sd.wait()
     print("  Recording complete.")
-    return audio.flatten()
+
+    audio = audio.flatten()
+
+    # Resample to target sample rate if needed
+    if native_sr != sample_rate:
+        from scipy.signal import resample
+        new_len = int(len(audio) * sample_rate / native_sr)
+        audio = resample(audio, new_len).astype(np.float32)
+        print(f"  Resampled {native_sr} Hz -> {sample_rate} Hz")
+
+    return audio
 
 
 def load_uap(uap_path: Path, target_length: int, sample_rate: int = config.SAMPLE_RATE) -> np.ndarray:
@@ -167,7 +189,7 @@ def main():
         help="Recording duration in seconds (default: 5)",
     )
     parser.add_argument(
-        "--snr", type=float, default=32,
+        "--snr", type=float, default=18,
         help="SNR in dB for mixing perturbation (default: 32)",
     )
     parser.add_argument(
@@ -181,6 +203,10 @@ def main():
     parser.add_argument(
         "--output-dir", type=str, default="/tmp/transcriptblocker_test",
         help="Directory for output wav files (default: /tmp/transcriptblocker_test)",
+    )
+    parser.add_argument(
+        "--input-device", type=int, default=None,
+        help="Input device index (default: system default mic)",
     )
     args = parser.parse_args()
 
@@ -203,7 +229,7 @@ def main():
     print()
 
     # Step 1: Record audio
-    clean_audio = record_audio(args.duration)
+    clean_audio = record_audio(args.duration, device=args.input_device)
     wavfile.write(str(clean_path), config.SAMPLE_RATE, (clean_audio * 32767).astype(np.int16))
     print(f"  Saved clean audio to {clean_path}")
     print()

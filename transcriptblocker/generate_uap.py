@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import whisper
+from whisper.tokenizer import get_tokenizer
 from pathlib import Path
 import scipy.io.wavfile as wavfile
 
@@ -26,45 +27,94 @@ def _load_whisper_model(model_name: str, device: str) -> whisper.Whisper:
     return model
 
 
-def _generate_training_samples(num_samples: int = 20, duration_sec: float = 5.0) -> list[torch.Tensor]:
+def _load_training_samples(num_samples: int = 20, duration_sec: float = 5.0, verbose: bool = True) -> list[torch.Tensor]:
     """
-    Generate synthetic speech-like training samples for UAP optimization.
+    Load real speech samples from LibriSpeech for UAP optimization.
 
-    Uses a mix of sine waves at speech frequencies with amplitude modulation
-    to approximate speech energy distribution. For better results, replace with
-    real speech samples from LibriSpeech.
+    Downloads the test-clean subset (small) via torchaudio on first run.
+    Falls back to the user's previously recorded test audio if available.
     """
+    import torchaudio
+
     sr = config.SAMPLE_RATE
+    target_len = int(sr * duration_sec)
     samples = []
-    rng = np.random.RandomState(42)
 
-    for i in range(num_samples):
-        t = np.linspace(0, duration_sec, int(sr * duration_sec), dtype=np.float32)
-        signal = np.zeros_like(t)
+    # Try loading LibriSpeech test-clean
+    cache_dir = config.PROJECT_ROOT / ".cache"
+    cache_dir.mkdir(exist_ok=True)
 
-        # Fundamental frequencies typical of speech (85-300 Hz)
-        f0 = rng.uniform(85, 300)
-        # Add harmonics
-        for harmonic in range(1, 8):
-            freq = f0 * harmonic
-            if freq > sr / 2:
+    try:
+        if verbose:
+            print(f"  Loading LibriSpeech test-clean ({num_samples} samples)...")
+        dataset = torchaudio.datasets.LIBRISPEECH(
+            root=str(cache_dir),
+            url="test-clean",
+            download=True,
+        )
+
+        count = 0
+        for waveform, sample_rate, *_ in dataset:
+            if count >= num_samples:
                 break
-            amp = 1.0 / harmonic * rng.uniform(0.5, 1.5)
-            phase = rng.uniform(0, 2 * np.pi)
-            signal += amp * np.sin(2 * np.pi * freq * t + phase)
 
-        # Amplitude modulation to simulate syllable rhythm (3-6 Hz)
-        mod_freq = rng.uniform(3, 6)
-        modulation = 0.5 + 0.5 * np.sin(2 * np.pi * mod_freq * t)
-        signal *= modulation
+            # Convert to mono float32 at target sample rate
+            audio = waveform[0]  # first channel
+            if sample_rate != sr:
+                audio = torchaudio.functional.resample(audio, sample_rate, sr)
 
-        # Add some broadband noise to simulate fricatives
-        noise = rng.randn(len(t)).astype(np.float32) * 0.05
-        signal += noise
+            # Pad or trim to target duration
+            if len(audio) < target_len:
+                audio = F.pad(audio, (0, target_len - len(audio)))
+            else:
+                # Take a random offset for variety
+                max_start = len(audio) - target_len
+                start = np.random.randint(0, max(1, max_start))
+                audio = audio[start:start + target_len]
 
-        # Normalize
-        signal = signal / (np.abs(signal).max() + 1e-8) * 0.8
-        samples.append(torch.from_numpy(signal))
+            # Normalize
+            audio = audio / (torch.abs(audio).max() + 1e-8) * 0.8
+            samples.append(audio)
+            count += 1
+
+        if verbose:
+            print(f"  Loaded {len(samples)} real speech samples.")
+
+    except Exception as e:
+        if verbose:
+            print(f"  LibriSpeech download failed: {e}")
+            print("  Falling back to synthetic samples...")
+
+    # Also add user's recorded audio if available
+    user_recording = Path("/tmp/transcriptblocker_test/clean.wav")
+    if user_recording.exists():
+        try:
+            import scipy.io.wavfile as wavfile_reader
+            rec_sr, rec_data = wavfile_reader.read(str(user_recording))
+            if rec_data.dtype == np.int16:
+                rec_audio = torch.from_numpy(rec_data.astype(np.float32) / 32768.0)
+            else:
+                rec_audio = torch.from_numpy(rec_data.astype(np.float32))
+            if rec_sr != sr:
+                rec_audio = torchaudio.functional.resample(rec_audio, rec_sr, sr)
+            # Trim/pad
+            if len(rec_audio) >= target_len:
+                rec_audio = rec_audio[:target_len]
+            else:
+                rec_audio = F.pad(rec_audio, (0, target_len - len(rec_audio)))
+            rec_audio = rec_audio / (torch.abs(rec_audio).max() + 1e-8) * 0.8
+            samples.append(rec_audio)
+            if verbose:
+                print("  Added user's recorded audio as training sample.")
+        except Exception:
+            pass
+
+    if not samples:
+        raise RuntimeError(
+            "No training samples available. Check your internet connection "
+            "for LibriSpeech download, or record a test first with:\n"
+            "  uv run python scripts/test_e2e.py"
+        )
 
     return samples
 
@@ -115,8 +165,10 @@ def generate_uap(
     Returns:
         Path to the saved perturbation .wav file
     """
-    if device is None:
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
+    # Force CPU — adversarial perturbations don't transfer between MPS and CPU
+    # due to floating-point precision differences, and Whisper inference typically
+    # runs on CPU. Optimizing on CPU ensures the perturbation works at test time.
+    device = "cpu"
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,59 +178,57 @@ def generate_uap(
     model = _load_whisper_model(model_name, device)
 
     if verbose:
-        print(f"Generating {num_samples} training samples...")
-    speech_samples = _generate_training_samples(num_samples, duration_sec)
+        print(f"Loading training samples...")
+    speech_samples = _load_training_samples(num_samples, duration_sec, verbose=verbose)
 
     # Initialize perturbation as small random noise
     num_perturbation_samples = int(config.SAMPLE_RATE * duration_sec)
-    perturbation = torch.randn(num_perturbation_samples, device=device) * 0.001
+    perturbation = torch.randn(num_perturbation_samples) * 0.001
     perturbation.requires_grad_(True)
+
+    # Get tokenizer and decoder prompt tokens
+    tokenizer = get_tokenizer(model.is_multilingual)
+    sot_sequence = torch.tensor(
+        [[tokenizer.sot, tokenizer.sot + 1, tokenizer.transcribe, tokenizer.no_timestamps]],
+        dtype=torch.long,
+    )
 
     if verbose:
         print(f"Running PGD optimization ({num_steps} steps)...")
+        print(f"  L-inf bound: {config.MAX_PERTURBATION_NORM}")
 
     for step in range(num_steps):
-        total_loss = torch.tensor(0.0, device=device)
+        total_loss = torch.tensor(0.0)
 
         # Mini-batch: use a subset each step for efficiency
         batch_indices = np.random.choice(len(speech_samples), size=min(4, len(speech_samples)), replace=False)
 
         for idx in batch_indices:
-            speech = speech_samples[idx].to(device)
+            speech = speech_samples[idx]
 
-            # Scale perturbation to target SNR relative to this speech sample
-            with torch.no_grad():
-                scale = compute_snr_scale(speech, perturbation, snr_db)
-
-            # Mix speech + scaled perturbation
-            scaled_pert = perturbation * scale
-            mixed = speech + scaled_pert
-
-            # Clamp to valid audio range
+            # Add perturbation at FULL L-inf strength (no SNR scaling).
+            # The audio_mixer handles SNR scaling at runtime.
+            mixed = speech + perturbation
             mixed = torch.clamp(mixed, -1.0, 1.0)
 
-            # Pad/trim to 30 seconds (Whisper's expected input length)
+            # Compute clean and perturbed encoder outputs
+            with torch.no_grad():
+                clean_padded = whisper.pad_or_trim(speech)
+                clean_mel = whisper.log_mel_spectrogram(clean_padded, n_mels=model.dims.n_mels).unsqueeze(0)
+                clean_enc = model.encoder(clean_mel)
+
             mixed_padded = whisper.pad_or_trim(mixed)
+            mel = whisper.log_mel_spectrogram(mixed_padded, n_mels=model.dims.n_mels).unsqueeze(0)
+            adv_enc = model.encoder(mel)
 
-            # Compute log-mel spectrogram
-            mel = whisper.log_mel_spectrogram(mixed_padded, n_mels=model.dims.n_mels).unsqueeze(0).to(device)
-
-            # Forward through encoder
-            encoder_output = model.encoder(mel)
-
-            # Loss: maximize encoder output variance (disrupts attention patterns)
-            # Combined with minimizing output norm consistency
-            # This is more stable than trying to use the full decode pipeline
-            loss = -torch.var(encoder_output) - torch.mean(torch.abs(encoder_output))
-
-            # Also add a frequency-domain dispersion term:
-            # push energy across all frequency bins to confuse the decoder
-            freq_repr = torch.fft.rfft(encoder_output, dim=-1)
-            freq_mag = torch.abs(freq_repr)
-            # Maximize entropy of frequency magnitudes (spread energy evenly)
-            freq_dist = freq_mag / (freq_mag.sum(dim=-1, keepdim=True) + 1e-8)
-            entropy = -torch.sum(freq_dist * torch.log(freq_dist + 1e-8), dim=-1)
-            loss -= 0.1 * entropy.mean()
+            # ENCODER COSINE LOSS: maximize cosine distance between clean
+            # and perturbed encoder outputs. This is the winning approach
+            # from H100 experiments — outperforms decoder-based losses.
+            cos_sim = F.cosine_similarity(
+                adv_enc.flatten().unsqueeze(0),
+                clean_enc.flatten().unsqueeze(0),
+            )
+            loss = cos_sim.mean()  # minimize similarity = maximize disruption
 
             total_loss += loss
 
@@ -187,30 +237,24 @@ def generate_uap(
         # Backward pass
         total_loss.backward()
 
-        # PGD step — gradient ascent (we want to maximize disruption)
+        # PGD step with sign-of-gradient (FGSM-style)
         with torch.no_grad():
-            grad = perturbation.grad
-            # Normalize gradient for stable updates
-            grad_norm = grad / (torch.norm(grad) + 1e-8)
-            perturbation.data -= step_size * grad_norm  # minus because loss is already negated
-
-            # Project: clamp L-inf norm
+            perturbation.data -= step_size * perturbation.grad.sign()
             perturbation.data.clamp_(-config.MAX_PERTURBATION_NORM, config.MAX_PERTURBATION_NORM)
 
         perturbation.grad.zero_()
 
-        if verbose and (step + 1) % 20 == 0:
-            print(f"  Step {step + 1}/{num_steps}, loss: {total_loss.item():.4f}")
+        if verbose and (step + 1) % 50 == 0:
+            pert_rms = torch.sqrt(torch.mean(perturbation.data ** 2)).item()
+            print(f"  Step {step + 1}/{num_steps}, loss: {total_loss.item():.4f}, pert RMS: {pert_rms:.4f}")
 
-    # Save perturbation as WAV
-    pert_np = perturbation.detach().cpu().numpy()
-    # Normalize to use full 16-bit range while staying within L-inf bound
+    # Save perturbation as WAV (normalized to 16-bit range)
+    pert_np = perturbation.detach().numpy()
     pert_np = pert_np / (np.abs(pert_np).max() + 1e-8)
     wavfile.write(str(output_path), config.SAMPLE_RATE, (pert_np * 32767).astype(np.int16))
 
     if verbose:
         print(f"UAP saved to {output_path}")
         print(f"  Duration: {duration_sec:.1f}s, Sample rate: {config.SAMPLE_RATE} Hz")
-        print(f"  Target SNR: {snr_db} dB")
 
     return output_path

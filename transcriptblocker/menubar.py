@@ -14,9 +14,9 @@ from .audio_mixer import AudioMixer
 
 
 STRENGTH_PRESETS = {
-    "Light (40dB)": 40.0,
-    "Normal (32dB)": 32.0,
-    "Aggressive (25dB)": 25.0,
+    "Light (25dB)": 25.0,
+    "Normal (20dB)": 20.0,
+    "Aggressive (15dB)": 15.0,
 }
 
 TITLE_ACTIVE = "\U0001f507 TB"  # muted speaker + TB
